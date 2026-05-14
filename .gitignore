@@ -1,3 +1,10 @@
 node_modules/
 .DS_Store
 *.log
+*.csv
+
+# pi project-local config and sessions
+.pi/
+
+# TypeScript incremental builds
+*.tsbuildinfo

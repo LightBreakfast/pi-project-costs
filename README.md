@@ -24,16 +24,23 @@ pi -e ./path/to/pi-project-costs/extensions/pi-project-costs.ts
 
 ## Commands
 
-### `/project-costs-usage`
+### `/project-costs-usage [--by-model]`
 
 Per-branch token & cost report for the **current session**. Shows tokens and costs broken down by branch, sorted by cost descending.
 
-### `/project-costs-stats [--all | --repo]`
+- `--by-model` — sub-groups each branch by model (e.g. separate lines for `claude-sonnet` vs `claude-opus`)
+
+### `/project-costs-stats [--all | --repo] [--by-model]`
 
 Cross-session per-branch aggregation.
 
 - `--repo` (default) — scans all session files for the current git repo
 - `--all` — scans session files across **all projects** on your machine, grouped by project
+- `--by-model` — sub-groups each branch by model
+
+### `/project-costs-config`
+
+Display the current merged configuration (global + project).
 
 ### `/project-costs-footer`
 
@@ -63,6 +70,47 @@ Export aggregated per-branch costs as a CSV file. Writes to `project-costs-<time
 | `cost_cache_read` | Cost of cache read tokens ($) |
 | `cost_cache_write` | Cost of cache write tokens ($) |
 | `cost_total` | Total cost ($) |
+
+## Configuration
+
+Optional JSON config files control tracking behavior. Merge priority: **project > global > defaults**.
+
+| Location | Scope |
+|----------|-------|
+| `~/.pi/agent/extensions/pi-project-costs.json` | Global (all projects) |
+| `.pi/extensions/pi-project-costs.json` | Project (overrides global) |
+
+### Schema
+
+```jsonc
+{
+  "enabled": true,         // master switch; set false to disable tracking
+  "gitOnly": true,          // only record when cwd is inside a git repo
+  "ignoreBranches": []      // branch names to skip (defaults to ["main", "master"])
+}
+```
+
+All fields are optional. Defaults:
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `true` | Disable to stop recording entirely for a project |
+| `gitOnly` | `true` | When true, directories with no git repo produce no entries |
+| `ignoreBranches` | `["main", "master"]` | Branch names to skip. Set to `[]` to track all branches |
+
+### Example: per-project disable
+
+`.pi/extensions/pi-project-costs.json`:
+
+```json
+{ "enabled": false }
+```
+
+### Example: track all branches
+
+```json
+{ "ignoreBranches": [] }
+```
 
 ## How it works
 

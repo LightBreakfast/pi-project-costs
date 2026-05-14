@@ -18,6 +18,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { execSync } from "node:child_process";
 import { readFileSync, readdirSync, existsSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
@@ -58,6 +59,56 @@ interface BranchAggregate {
   costCacheRead: number;
   costCacheWrite: number;
   messageCount: number;
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+interface PiProjectCostsConfig {
+  enabled?: boolean;
+  gitOnly?: boolean;
+  ignoreBranches?: string[];
+}
+
+interface ResolvedConfig {
+  enabled: boolean;
+  gitOnly: boolean;
+  ignoreBranches: string[];
+}
+
+const DEFAULT_CONFIG: ResolvedConfig = {
+  enabled: true,
+  gitOnly: true,
+  ignoreBranches: ["main", "master"],
+};
+
+/** Read and parse a JSON file, returning null on any failure. */
+function readJSON(filePath: string): Record<string, unknown> | null {
+  try {
+    return JSON.parse(readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** Load merged config: defaults < global < project. */
+function loadConfig(cwd: string): ResolvedConfig {
+  const global = readJSON(
+    path.join(homedir(), ".pi", "agent", "extensions", "pi-project-costs.json")
+  ) as PiProjectCostsConfig | null;
+  const project = readJSON(
+    path.join(cwd, ".pi", "extensions", "pi-project-costs.json")
+  ) as PiProjectCostsConfig | null;
+
+  return {
+    enabled: project?.enabled ?? global?.enabled ?? DEFAULT_CONFIG.enabled,
+    gitOnly: project?.gitOnly ?? global?.gitOnly ?? DEFAULT_CONFIG.gitOnly,
+    ignoreBranches:
+      project?.ignoreBranches ??
+      global?.ignoreBranches ??
+      DEFAULT_CONFIG.ignoreBranches,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +237,52 @@ function aggregateByBranch(entries: BranchUsageEntry[]): Map<string, BranchAggre
   }
 
   return map;
+}
+
+/** Aggregate branch-usage entries grouped by branch, then by model. */
+function aggregateByBranchAndModel(
+  entries: BranchUsageEntry[]
+): Map<string, Map<string, BranchAggregate>> {
+  const branches = new Map<string, Map<string, BranchAggregate>>();
+
+  for (const e of entries) {
+    let models = branches.get(e.branch);
+    if (!models) {
+      models = new Map();
+      branches.set(e.branch, models);
+    }
+
+    let agg = models.get(e.model);
+    if (!agg) {
+      agg = {
+        tokens: 0,
+        cost: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costInput: 0,
+        costOutput: 0,
+        costCacheRead: 0,
+        costCacheWrite: 0,
+        messageCount: 0,
+      };
+      models.set(e.model, agg);
+    }
+    agg.tokens += e.usage.totalTokens ?? 0;
+    agg.cost += e.usage.cost?.total ?? 0;
+    agg.inputTokens += e.usage.input ?? 0;
+    agg.outputTokens += e.usage.output ?? 0;
+    agg.cacheReadTokens += e.usage.cacheRead ?? 0;
+    agg.cacheWriteTokens += e.usage.cacheWrite ?? 0;
+    agg.costInput += e.usage.cost?.input ?? 0;
+    agg.costOutput += e.usage.cost?.output ?? 0;
+    agg.costCacheRead += e.usage.cost?.cacheRead ?? 0;
+    agg.costCacheWrite += e.usage.cost?.cacheWrite ?? 0;
+    agg.messageCount++;
+  }
+
+  return branches;
 }
 
 /** Aggregate branch-usage entries grouped by project, then by branch. */
@@ -319,10 +416,22 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_end", async (event, ctx) => {
     if (event.message.role !== "assistant") return;
 
-    const branch = getBranch(ctx.cwd) || "unknown";
+    const config = loadConfig(ctx.cwd);
+    if (!config.enabled) return;
+
+    const branch = getBranch(ctx.cwd);
+    if (config.gitOnly && !branch) return;
+
+    const branchName = branch || "unknown";
+    if (
+      config.ignoreBranches.length > 0 &&
+      config.ignoreBranches.some((pattern) => branchName === pattern)
+    ) {
+      return;
+    }
 
     pi.appendEntry(CUSTOM_TYPE, {
-      branch,
+      branch: branchName,
       usage: event.message.usage,
       model: `${event.message.provider}/${event.message.model}`,
       timestamp: event.message.timestamp,
@@ -334,8 +443,11 @@ export default function (pi: ExtensionAPI) {
   // =========================================================================
 
   pi.registerCommand("project-costs-usage", {
-    description: "Show token usage and cost per git branch (current session)",
+    description: "Show token usage and cost per git branch (current session). Use --by-model for model breakdown.",
     handler: async (_args, ctx) => {
+      const args = (_args || "").trim();
+      const byModel = args === "--by-model";
+
       const entries = extractBranchEntries(ctx.sessionManager.getEntries());
 
       if (entries.length === 0) {
@@ -343,29 +455,56 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const aggregated = aggregateByBranch(entries);
-
-      // Sort by cost descending
-      const sorted = [...aggregated.entries()].sort((a, b) => b[1].cost - a[1].cost);
-
       const currentBranch = getBranch(ctx.cwd) || "unknown";
       const lines: string[] = [
-        `╭─ Project Costs (current session) ─`,
+        `╭─ Project Costs (current session)${byModel ? " — by model" : ""}`,
         `│ Current branch: ${currentBranch}`,
         `│ Total entries:  ${entries.length}`,
         `├─`,
       ];
 
-      for (const [branch, agg] of sorted) {
-        lines.push(formatAggregate(branch, agg));
-        lines.push(`│`);
+      if (byModel) {
+        const byBranch = aggregateByBranchAndModel(entries);
+        const sortedBranches = [...byBranch.entries()].sort((a, b) => {
+          const aCost = [...a[1].values()].reduce((s, m) => s + m.cost, 0);
+          const bCost = [...b[1].values()].reduce((s, m) => s + m.cost, 0);
+          return bCost - aCost;
+        });
+
+        let grandTotal = 0, grandCost = 0;
+        for (const [branch, models] of sortedBranches) {
+          const sortedModels = [...models.entries()].sort((a, b) => b[1].cost - a[1].cost);
+          const branchTokens = sortedModels.reduce((s, [, a]) => s + a.tokens, 0);
+          const branchCost = sortedModels.reduce((s, [, a]) => s + a.cost, 0);
+          grandTotal += branchTokens;
+          grandCost += branchCost;
+
+          lines.push(`  ${branch}:`);
+          lines.push(`    Messages:   ${sortedModels.reduce((s, [, a]) => s + a.messageCount, 0)}`);
+          lines.push(`    Total:      ${fmt(branchTokens)} tokens  ${fmtCost(branchCost)}`);
+          for (const [model, agg] of sortedModels) {
+            lines.push(`    ├─ ${model}:  ${fmt(agg.tokens)} tokens  ${fmtCost(agg.cost)}  (${agg.messageCount} msgs)`);
+          }
+          lines.push(`│`);
+        }
+
+        lines.push(`├─`);
+        lines.push(`  TOTAL: ${fmt(grandTotal)} tokens  ${fmtCost(grandCost)}`);
+      } else {
+        const aggregated = aggregateByBranch(entries);
+        const sorted = [...aggregated.entries()].sort((a, b) => b[1].cost - a[1].cost);
+
+        for (const [branch, agg] of sorted) {
+          lines.push(formatAggregate(branch, agg));
+          lines.push(`│`);
+        }
+
+        const grandTotal = sorted.reduce((s, [, a]) => s + a.tokens, 0);
+        const grandCost = sorted.reduce((s, [, a]) => s + a.cost, 0);
+        lines.push(`├─`);
+        lines.push(`  TOTAL: ${fmt(grandTotal)} tokens  ${fmtCost(grandCost)}`);
       }
 
-      // Grand total
-      const grandTotal = sorted.reduce((s, [, a]) => s + a.tokens, 0);
-      const grandCost = sorted.reduce((s, [, a]) => s + a.cost, 0);
-      lines.push(`├─`);
-      lines.push(`  TOTAL: ${fmt(grandTotal)} tokens  ${fmtCost(grandCost)}`);
       lines.push(`╰─`);
 
       ctx.ui.notify(lines.join("\n"), "info");
@@ -377,11 +516,13 @@ export default function (pi: ExtensionAPI) {
   // =========================================================================
 
   pi.registerCommand("project-costs-stats", {
-    description: "Show per-branch token usage across sessions. Use --all for all projects, --repo for current repo.",
+    description: "Show per-branch token usage across sessions. Use --all for all projects, --repo for current repo, --by-model for model breakdown.",
     handler: async (args, ctx) => {
-      const flag = (args || "").trim().toLowerCase();
-      const allProjects = flag === "--all";
-      const thisRepo = flag === "--repo" || (!allProjects && flag === "");
+      const raw = (args || "").trim().toLowerCase();
+      const tokens = raw.split(/\s+/).filter(Boolean);
+      const allProjects = tokens.includes("--all");
+      const byModel = tokens.includes("--by-model");
+      const thisRepo = tokens.includes("--repo") || (!allProjects && tokens.length === 0) || (!allProjects && tokens.every(t => t === "--by-model"));
 
       let sessionDirs: string[] = [];
 
@@ -431,7 +572,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const lines: string[] = [
-        `╭─ Project Costs${allProjects ? " (ALL PROJECTS)" : ""}`,
+        `╭─ Project Costs${allProjects ? " (ALL PROJECTS)" : ""}${byModel ? " — by model" : ""}`,
         `│ Sessions scanned: ${fileCount}`,
         `│ Entries found:    ${allEntries.length}`,
       ];
@@ -449,9 +590,28 @@ export default function (pi: ExtensionAPI) {
           grandCost += projCost;
 
           lines.push(`├─ ${project} ─`);
-          for (const [branch, agg] of sorted) {
-            lines.push(formatAggregate(branch, agg));
+
+          if (byModel) {
+            const projectEntries = allEntries.filter(e => (e.project || "(unknown)") === project);
+            const byBranchAndModel = aggregateByBranchAndModel(projectEntries);
+            for (const [branch, models] of [...byBranchAndModel.entries()].sort((a, b) => {
+              const aC = [...a[1].values()].reduce((s, m) => s + m.cost, 0);
+              const bC = [...b[1].values()].reduce((s, m) => s + m.cost, 0);
+              return bC - aC;
+            })) {
+              const branchTokens = [...models.values()].reduce((s, m) => s + m.tokens, 0);
+              const branchCost = [...models.values()].reduce((s, m) => s + m.cost, 0);
+              lines.push(`  ${branch}:  ${fmt(branchTokens)} tokens  ${fmtCost(branchCost)}`);
+              for (const [model, agg] of [...models.entries()].sort((a, b) => b[1].cost - a[1].cost)) {
+                lines.push(`    ├─ ${model}:  ${fmt(agg.tokens)} tokens  ${fmtCost(agg.cost)}  (${agg.messageCount} msgs)`);
+              }
+            }
+          } else {
+            for (const [branch, agg] of sorted) {
+              lines.push(formatAggregate(branch, agg));
+            }
           }
+
           lines.push(`│  Project total: ${fmt(projTokens)} tokens  ${fmtCost(projCost)}`);
         }
 
@@ -459,21 +619,52 @@ export default function (pi: ExtensionAPI) {
         lines.push(`  GRAND TOTAL: ${fmt(grandTokens)} tokens  ${fmtCost(grandCost)}`);
         lines.push(`╰─`);
       } else {
-        // Single repo — flat per-branch
-        const aggregated = aggregateByBranch(allEntries);
-        const sorted = [...aggregated.entries()].sort((a, b) => b[1].cost - a[1].cost);
+        // Single repo
+        if (byModel) {
+          const byBranch = aggregateByBranchAndModel(allEntries);
+          const sortedBranches = [...byBranch.entries()].sort((a, b) => {
+            const aCost = [...a[1].values()].reduce((s, m) => s + m.cost, 0);
+            const bCost = [...b[1].values()].reduce((s, m) => s + m.cost, 0);
+            return bCost - aCost;
+          });
 
-        lines.push(`├─`);
-        for (const [branch, agg] of sorted) {
-          lines.push(formatAggregate(branch, agg));
-          lines.push(`│`);
+          lines.push(`├─`);
+          let grandTotal = 0, grandCost = 0;
+          for (const [branch, models] of sortedBranches) {
+            const sortedModels = [...models.entries()].sort((a, b) => b[1].cost - a[1].cost);
+            const branchTokens = sortedModels.reduce((s, [, a]) => s + a.tokens, 0);
+            const branchCost = sortedModels.reduce((s, [, a]) => s + a.cost, 0);
+            grandTotal += branchTokens;
+            grandCost += branchCost;
+
+            lines.push(`  ${branch}:`);
+            lines.push(`    Messages:   ${sortedModels.reduce((s, [, a]) => s + a.messageCount, 0)}`);
+            lines.push(`    Total:      ${fmt(branchTokens)} tokens  ${fmtCost(branchCost)}`);
+            for (const [model, agg] of sortedModels) {
+              lines.push(`    ├─ ${model}:  ${fmt(agg.tokens)} tokens  ${fmtCost(agg.cost)}  (${agg.messageCount} msgs)`);
+            }
+            lines.push(`│`);
+          }
+          lines.push(`├─`);
+          lines.push(`  TOTAL: ${fmt(grandTotal)} tokens  ${fmtCost(grandCost)}`);
+          lines.push(`╰─`);
+        } else {
+          // flat per-branch
+          const aggregated = aggregateByBranch(allEntries);
+          const sorted = [...aggregated.entries()].sort((a, b) => b[1].cost - a[1].cost);
+
+          lines.push(`├─`);
+          for (const [branch, agg] of sorted) {
+            lines.push(formatAggregate(branch, agg));
+            lines.push(`│`);
+          }
+
+          const grandTotal = sorted.reduce((s, [, a]) => s + a.tokens, 0);
+          const grandCost = sorted.reduce((s, [, a]) => s + a.cost, 0);
+          lines.push(`├─`);
+          lines.push(`  TOTAL: ${fmt(grandTotal)} tokens  ${fmtCost(grandCost)}`);
+          lines.push(`╰─`);
         }
-
-        const grandTotal = sorted.reduce((s, [, a]) => s + a.tokens, 0);
-        const grandCost = sorted.reduce((s, [, a]) => s + a.cost, 0);
-        lines.push(`├─`);
-        lines.push(`  TOTAL: ${fmt(grandTotal)} tokens  ${fmtCost(grandCost)}`);
-        lines.push(`╰─`);
       }
 
       ctx.ui.notify(lines.join("\n"), "info");
@@ -629,6 +820,25 @@ export default function (pi: ExtensionAPI) {
         `Exported ${csvRows.length} branch(es) across ${fileCount} session(s) to ${fileName}`,
         "info"
       );
+    },
+  });
+
+  // =========================================================================
+  // 6. /project-costs-config  — show current config
+  // =========================================================================
+
+  pi.registerCommand("project-costs-config", {
+    description: "Show the current merged configuration",
+    handler: async (_args, ctx) => {
+      const config = loadConfig(ctx.cwd);
+      const lines = [
+        `╭─ Project Costs Config`,
+        `│ Enabled:          ${config.enabled}`,
+        `│ Git repos only:   ${config.gitOnly}`,
+        `│ Ignore branches:  ${config.ignoreBranches.join(", ") || "(none)"}`,
+        `╰─`,
+      ];
+      ctx.ui.notify(lines.join("\n"), "info");
     },
   });
 }
