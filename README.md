@@ -121,8 +121,6 @@ All fields are optional and inherit their defaults when omitted.
 
 On every assistant message the extension records the current git branch, model, token counts, and cost as a custom entry in pi's session file. Data survives restarts.
 
-Reads data recorded by the older `branch-tracker` extension, so existing history is preserved.
-
 ## License
 
 MIT
