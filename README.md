@@ -1,24 +1,14 @@
 # pi-project-costs
 
-Track LLM token usage and costs per git branch across pi sessions.
+Track LLM token usage and cost per git branch across pi sessions.
 
-## Installation
-
-### From GitHub
+## Quick start
 
 ```bash
+# Install from GitHub
 pi install git:github.com/LightBreakfast/pi-project-costs
-```
 
-### From local path (development)
-
-```bash
-pi install ./path/to/pi-project-costs
-```
-
-### One-shot test (no install)
-
-```bash
+# One-shot test (no install)
 pi -e ./path/to/pi-project-costs/extensions/pi-project-costs.ts
 ```
 
@@ -26,54 +16,76 @@ pi -e ./path/to/pi-project-costs/extensions/pi-project-costs.ts
 
 ### `/project-costs-usage [--by-model]`
 
-Per-branch token & cost report for the **current session**. Shows tokens and costs broken down by branch, sorted by cost descending.
+Per-branch token and cost report for the current session, sorted by cost descending.
 
-- `--by-model` — sub-groups each branch by model (e.g. separate lines for `claude-sonnet` vs `claude-opus`)
+```
+/project-costs-usage
+
+  feature/api-v2:
+    Total:  12.4k tokens  $0.04  (4 msgs)
+  main:
+    Total:   3.1k tokens  $0.01  (1 msg)
+```
+
+Pass `--by-model` to break each branch down by model:
+
+```
+/project-costs-usage --by-model
+
+  feature/api-v2:
+    Messages: 4
+    Total:    12.4k tokens  $0.04
+    ├─ claude-sonnet-4-20250514:  8.2k tokens  $0.03  (3 msgs)
+    └─ claude-haiku-4-20250514:   4.2k tokens  $0.01  (1 msg)
+  main:
+    Messages: 1
+    Total:    3.1k tokens  $0.01
+    └─ claude-sonnet-4-20250514:  3.1k tokens  $0.01  (1 msg)
+```
 
 ### `/project-costs-stats [--all | --repo] [--by-model]`
 
-Cross-session per-branch aggregation.
+Cross-session aggregation across all saved sessions for the repo.
 
-- `--repo` (default) — scans all session files for the current git repo
-- `--all` — scans session files across **all projects** on your machine, grouped by project
-- `--by-model` — sub-groups each branch by model
+```
+/project-costs-stats --repo
 
-### `/project-costs-config`
+  feature/api-v2:
+    Total:  45.2k tokens  $0.15  (14 msgs)
+  chore/cleanup:
+    Total:   8.7k tokens  $0.03  (5 msgs)
+  main:
+    Total:   5.1k tokens  $0.02  (2 msgs)
+```
 
-Display the current merged configuration (global + project).
-
-### `/project-costs-footer`
-
-Toggle a footer in the TUI showing real-time token usage for the current branch. Run again to disable.
+Use `--all` to scan every project on the machine, `--by-model` for per-model subtotals.
 
 ### `/project-costs-export [--all]`
 
-Export aggregated per-branch costs as a CSV file. Writes to `project-costs-<timestamp>.csv` in the current working directory.
+Export aggregated costs as CSV. Writes `project-costs-<timestamp>.csv` to the current directory.
 
-- Default — current repo only
-- `--all` — all projects, with a `project` column to distinguish them
+- Default: current repo only
+- `--all`: all projects (adds a project column)
 
-#### CSV Columns
+### `/project-costs-footer`
 
-| Column | Description |
-|--------|-------------|
-| `project` | Project directory name |
-| `branch` | Git branch name |
-| `message_count` | Number of assistant messages recorded |
-| `input_tokens` | Total input tokens |
-| `output_tokens` | Total output tokens |
-| `cache_read_tokens` | Total cache read tokens |
-| `cache_write_tokens` | Total cache write tokens |
-| `total_tokens` | Total tokens (input + output + cache_read + cache_write) |
-| `cost_input` | Cost of input tokens ($) |
-| `cost_output` | Cost of output tokens ($) |
-| `cost_cache_read` | Cost of cache read tokens ($) |
-| `cost_cache_write` | Cost of cache write tokens ($) |
-| `cost_total` | Total cost ($) |
+Toggle a real-time footer in the TUI showing the current branch's token usage. Run again to disable.
+
+### `/project-costs-config`
+
+Display the active merged configuration:
+
+```
+/project-costs-config
+
+  Enabled:         true
+  Git repos only:  true
+  Ignore branches: main, master
+```
 
 ## Configuration
 
-Optional JSON config files control tracking behavior. Merge priority: **project > global > defaults**.
+Optional JSON files control tracking behavior. Merge priority: project > global > defaults.
 
 | Location | Scope |
 |----------|-------|
@@ -84,29 +96,22 @@ Optional JSON config files control tracking behavior. Merge priority: **project 
 
 ```jsonc
 {
-  "enabled": true,         // master switch; set false to disable tracking
-  "gitOnly": true,          // only record when cwd is inside a git repo
-  "ignoreBranches": []      // branch names to skip (defaults to ["main", "master"])
+  "enabled": true,         // master switch; set false to stop all tracking
+  "gitOnly": true,         // only record inside git repos (avoids "unknown" entries)
+  "ignoreBranches": []     // branch names to skip (default: ["main", "master"])
 }
 ```
 
-All fields are optional. Defaults:
+All fields are optional and inherit their defaults when omitted.
 
-| Key | Default | Description |
-|-----|---------|-------------|
-| `enabled` | `true` | Disable to stop recording entirely for a project |
-| `gitOnly` | `true` | When true, directories with no git repo produce no entries |
-| `ignoreBranches` | `["main", "master"]` | Branch names to skip. Set to `[]` to track all branches |
-
-### Example: per-project disable
-
-`.pi/extensions/pi-project-costs.json`:
+**Disable tracking for one project:**
 
 ```json
+// .pi/extensions/pi-project-costs.json
 { "enabled": false }
 ```
 
-### Example: track all branches
+**Track every branch (including main/master):**
 
 ```json
 { "ignoreBranches": [] }
@@ -114,9 +119,9 @@ All fields are optional. Defaults:
 
 ## How it works
 
-On every assistant message, the extension records the current git branch along with the message's token usage and cost. Data is stored as custom entries in pi's session files so it survives restarts.
+On every assistant message the extension records the current git branch, model, token counts, and cost as a custom entry in pi's session file. Data survives restarts.
 
-The extension also reads data recorded by the older `branch-tracker` extension, so you won't lose history when upgrading.
+Reads data recorded by the older `branch-tracker` extension, so existing history is preserved.
 
 ## License
 
