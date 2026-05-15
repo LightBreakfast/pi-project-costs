@@ -5,13 +5,13 @@
  *
  * Features:
  *   • Auto-records the current git branch on every assistant message
- *   • /project-costs-usage   — per-branch token & cost report for the current session
- *   • /project-costs-stats   — per-branch stats across ALL sessions for this repo
- *   • /project-costs-export  — export aggregated branch costs as CSV
- *   • /project-costs-footer  — toggle a footer showing current branch usage in real time
- *   • /project-costs-config  — show current merged configuration
- *   • /project-costs-prune   — remove entries for a branch from the current session
- *   • /project-costs-cleanup — remove entries older than a date
+ *   • /project-costs usage [--by-model]           — per-branch costs for current session
+ *   • /project-costs stats [--all|--repo] [--by-model] — costs across all sessions
+ *   • /project-costs export [--all]               — export aggregated costs as CSV
+ *   • /project-costs footer                       — toggle real-time branch cost footer
+ *   • /project-costs config                       — show current configuration
+ *   • /project-costs prune <branch>               — remove entries for a branch
+ *   • /project-costs cleanup --before YYYY-MM-DD  — remove entries older than a date
  *
  * Stored as session custom entries so data survives restarts:
  *   { customType: "project-costs:usage", data: { branch, usage, model, timestamp } }
@@ -481,39 +481,179 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
-  // =========================================================================
-  // 2. /project-costs-usage  — per-branch report for the current session
-  // =========================================================================
+  async function handleUsage(args: string, ctx: any) {
+    const byModel = (args || "").trim() === "--by-model";
 
-  pi.registerCommand("project-costs-usage", {
-    description: "Show token usage and cost per git branch (current session). Use --by-model for model breakdown.",
-    handler: async (_args, ctx) => {
-      const args = (_args || "").trim();
-      const byModel = args === "--by-model";
+    const entries = extractBranchEntries(ctx.sessionManager.getEntries());
 
-      const entries = extractBranchEntries(ctx.sessionManager.getEntries());
+    if (entries.length === 0) {
+      ctx.ui.notify("No project cost tracking data found in this session. Start a conversation first!", "info");
+      return;
+    }
 
-      if (entries.length === 0) {
-        ctx.ui.notify("No project cost tracking data found in this session. Start a conversation first!", "info");
-        return;
+    const currentBranch = getBranch(ctx.cwd) || "unknown";
+    const lines: string[] = [
+      `╭─ Project Costs (current session)${byModel ? " — by model" : ""}`,
+      `│ Current branch: ${currentBranch}`,
+      `│ Total entries:  ${entries.length}`,
+      `├─`,
+    ];
+
+    if (byModel) {
+      const byBranch = aggregateByBranchAndModel(entries);
+      const sortedBranches = [...byBranch.entries()].sort((a, b) => {
+        const aCost = [...a[1].values()].reduce((s, m) => s + m.cost, 0);
+        const bCost = [...b[1].values()].reduce((s, m) => s + m.cost, 0);
+        return bCost - aCost;
+      });
+
+      let grandTotal = 0, grandCost = 0;
+      for (const [branch, models] of sortedBranches) {
+        const sortedModels = [...models.entries()].sort((a, b) => b[1].cost - a[1].cost);
+        const branchTokens = sortedModels.reduce((s, [, a]) => s + a.tokens, 0);
+        const branchCost = sortedModels.reduce((s, [, a]) => s + a.cost, 0);
+        grandTotal += branchTokens;
+        grandCost += branchCost;
+
+        lines.push(`  ${branch}:`);
+        lines.push(`    Messages:   ${sortedModels.reduce((s, [, a]) => s + a.messageCount, 0)}`);
+        lines.push(`    Total:      ${fmt(branchTokens)} tokens  ${fmtCost(branchCost)}`);
+        for (const [model, agg] of sortedModels) {
+          lines.push(`    ├─ ${model}:  ${fmt(agg.tokens)} tokens  ${fmtCost(agg.cost)}  (${agg.messageCount} msgs)`);
+        }
+        lines.push(`│`);
       }
 
-      const currentBranch = getBranch(ctx.cwd) || "unknown";
-      const lines: string[] = [
-        `╭─ Project Costs (current session)${byModel ? " — by model" : ""}`,
-        `│ Current branch: ${currentBranch}`,
-        `│ Total entries:  ${entries.length}`,
-        `├─`,
-      ];
+      lines.push(`├─`);
+      lines.push(`  TOTAL: ${fmt(grandTotal)} tokens  ${fmtCost(grandCost)}`);
+    } else {
+      const aggregated = aggregateByBranch(entries);
+      const sorted = [...aggregated.entries()].sort((a, b) => b[1].cost - a[1].cost);
 
+      for (const [branch, agg] of sorted) {
+        lines.push(formatAggregate(branch, agg));
+        lines.push(`│`);
+      }
+
+      const grandTotal = sorted.reduce((s, [, a]) => s + a.tokens, 0);
+      const grandCost = sorted.reduce((s, [, a]) => s + a.cost, 0);
+      lines.push(`├─`);
+      lines.push(`  TOTAL: ${fmt(grandTotal)} tokens  ${fmtCost(grandCost)}`);
+    }
+
+    lines.push(`╰─`);
+
+    ctx.ui.notify(lines.join("\n"), "info");
+  }
+
+  async function handleStats(args: string, ctx: any) {
+    const raw = (args || "").trim().toLowerCase();
+    const tokens = raw.split(/\s+/).filter(Boolean);
+    const allProjects = tokens.includes("--all");
+    const byModel = tokens.includes("--by-model");
+    const thisRepo = tokens.includes("--repo") || (!allProjects && tokens.length === 0) || (!allProjects && tokens.every(t => t === "--by-model"));
+
+    let sessionDirs: string[] = [];
+
+    if (allProjects) {
+      const base = path.join(process.env.HOME || "~", ".pi", "agent", "sessions");
+      if (existsSync(base)) {
+        sessionDirs = readdirSync(base, { withFileTypes: true })
+          .filter((d) => d.isDirectory())
+          .map((d) => path.join(base, d.name));
+      }
+    } else {
+      const dir = sessionDirFor(ctx.cwd);
+      sessionDirs = [dir];
+    }
+
+    if (sessionDirs.length === 0) {
+      ctx.ui.notify("No session directories found.", "error");
+      return;
+    }
+
+    const allEntries: BranchUsageEntry[] = [];
+    let fileCount = 0;
+
+    for (const dir of sessionDirs) {
+      if (!existsSync(dir)) continue;
+      const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
+      for (const file of files) {
+        fileCount++;
+        const filePath = path.join(dir, file);
+        const rawEntries = parseSessionFile(filePath);
+        const project = allProjects ? projectNameFromDir(dir) : undefined;
+        const branchEntries = extractBranchEntries(rawEntries, project);
+        for (const be of branchEntries) {
+          allEntries.push(be);
+        }
+      }
+    }
+
+    if (allEntries.length === 0) {
+      ctx.ui.notify(
+        `No project cost tracking data found across ${fileCount} session file(s). Make sure the extension was loaded during those sessions.`,
+        "info"
+      );
+      return;
+    }
+
+    const lines: string[] = [
+      `╭─ Project Costs${allProjects ? " (ALL PROJECTS)" : ""}${byModel ? " — by model" : ""}`,
+      `│ Sessions scanned: ${fileCount}`,
+      `│ Entries found:    ${allEntries.length}`,
+    ];
+
+    if (allProjects) {
+      const byProject = aggregateByProject(allEntries);
+      let grandTokens = 0, grandCost = 0;
+
+      for (const [project, branches] of byProject) {
+        const sorted = [...branches.entries()].sort((a, b) => b[1].cost - a[1].cost);
+        const projTokens = sorted.reduce((s, [, a]) => s + a.tokens, 0);
+        const projCost = sorted.reduce((s, [, a]) => s + a.cost, 0);
+        grandTokens += projTokens;
+        grandCost += projCost;
+
+        lines.push(`├─ ${project} ─`);
+
+        if (byModel) {
+          const projectEntries = allEntries.filter(e => (e.project || "(unknown)") === project);
+          const byBranchAndModel = aggregateByBranchAndModel(projectEntries);
+          for (const [branch, models] of [...byBranchAndModel.entries()].sort((a, b) => {
+            const aC = [...a[1].values()].reduce((s, m) => s + m.cost, 0);
+            const bC = [...b[1].values()].reduce((s, m) => s + m.cost, 0);
+            return bC - aC;
+          })) {
+            const branchTokens = [...models.values()].reduce((s, m) => s + m.tokens, 0);
+            const branchCost = [...models.values()].reduce((s, m) => s + m.cost, 0);
+            lines.push(`  ${branch}:  ${fmt(branchTokens)} tokens  ${fmtCost(branchCost)}`);
+            for (const [model, agg] of [...models.entries()].sort((a, b) => b[1].cost - a[1].cost)) {
+              lines.push(`    ├─ ${model}:  ${fmt(agg.tokens)} tokens  ${fmtCost(agg.cost)}  (${agg.messageCount} msgs)`);
+            }
+          }
+        } else {
+          for (const [branch, agg] of sorted) {
+            lines.push(formatAggregate(branch, agg));
+          }
+        }
+
+        lines.push(`│  Project total: ${fmt(projTokens)} tokens  ${fmtCost(projCost)}`);
+      }
+
+      lines.push(`├─`);
+      lines.push(`  GRAND TOTAL: ${fmt(grandTokens)} tokens  ${fmtCost(grandCost)}`);
+      lines.push(`╰─`);
+    } else {
       if (byModel) {
-        const byBranch = aggregateByBranchAndModel(entries);
+        const byBranch = aggregateByBranchAndModel(allEntries);
         const sortedBranches = [...byBranch.entries()].sort((a, b) => {
           const aCost = [...a[1].values()].reduce((s, m) => s + m.cost, 0);
           const bCost = [...b[1].values()].reduce((s, m) => s + m.cost, 0);
           return bCost - aCost;
         });
 
+        lines.push(`├─`);
         let grandTotal = 0, grandCost = 0;
         for (const [branch, models] of sortedBranches) {
           const sortedModels = [...models.entries()].sort((a, b) => b[1].cost - a[1].cost);
@@ -530,13 +670,14 @@ export default function (pi: ExtensionAPI) {
           }
           lines.push(`│`);
         }
-
         lines.push(`├─`);
         lines.push(`  TOTAL: ${fmt(grandTotal)} tokens  ${fmtCost(grandCost)}`);
+        lines.push(`╰─`);
       } else {
-        const aggregated = aggregateByBranch(entries);
+        const aggregated = aggregateByBranch(allEntries);
         const sorted = [...aggregated.entries()].sort((a, b) => b[1].cost - a[1].cost);
 
+        lines.push(`├─`);
         for (const [branch, agg] of sorted) {
           lines.push(formatAggregate(branch, agg));
           lines.push(`│`);
@@ -546,430 +687,274 @@ export default function (pi: ExtensionAPI) {
         const grandCost = sorted.reduce((s, [, a]) => s + a.cost, 0);
         lines.push(`├─`);
         lines.push(`  TOTAL: ${fmt(grandTotal)} tokens  ${fmtCost(grandCost)}`);
-      }
-
-      lines.push(`╰─`);
-
-      ctx.ui.notify(lines.join("\n"), "info");
-    },
-  });
-
-  // =========================================================================
-  // 3. /project-costs-stats [--all | --repo]  — cross-session aggregation
-  // =========================================================================
-
-  pi.registerCommand("project-costs-stats", {
-    description: "Show per-branch token usage across sessions. Use --all for all projects, --repo for current repo, --by-model for model breakdown.",
-    handler: async (args, ctx) => {
-      const raw = (args || "").trim().toLowerCase();
-      const tokens = raw.split(/\s+/).filter(Boolean);
-      const allProjects = tokens.includes("--all");
-      const byModel = tokens.includes("--by-model");
-      const thisRepo = tokens.includes("--repo") || (!allProjects && tokens.length === 0) || (!allProjects && tokens.every(t => t === "--by-model"));
-
-      let sessionDirs: string[] = [];
-
-      if (allProjects) {
-        const base = path.join(process.env.HOME || "~", ".pi", "agent", "sessions");
-        if (existsSync(base)) {
-          sessionDirs = readdirSync(base, { withFileTypes: true })
-            .filter((d) => d.isDirectory())
-            .map((d) => path.join(base, d.name));
-        }
-      } else {
-        // Current repo only (default)
-        const dir = sessionDirFor(ctx.cwd);
-        sessionDirs = [dir];
-      }
-
-      if (sessionDirs.length === 0) {
-        ctx.ui.notify("No session directories found.", "error");
-        return;
-      }
-
-      // Collect branch entries from all session files
-      const allEntries: BranchUsageEntry[] = [];
-      let fileCount = 0;
-
-      for (const dir of sessionDirs) {
-        if (!existsSync(dir)) continue;
-        const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
-        for (const file of files) {
-          fileCount++;
-          const filePath = path.join(dir, file);
-          const rawEntries = parseSessionFile(filePath);
-          const project = allProjects ? projectNameFromDir(dir) : undefined;
-          const branchEntries = extractBranchEntries(rawEntries, project);
-          for (const be of branchEntries) {
-            allEntries.push(be);
-          }
-        }
-      }
-
-      if (allEntries.length === 0) {
-        ctx.ui.notify(
-          `No project cost tracking data found across ${fileCount} session file(s). Make sure the extension was loaded during those sessions.`,
-          "info"
-        );
-        return;
-      }
-
-      const lines: string[] = [
-        `╭─ Project Costs${allProjects ? " (ALL PROJECTS)" : ""}${byModel ? " — by model" : ""}`,
-        `│ Sessions scanned: ${fileCount}`,
-        `│ Entries found:    ${allEntries.length}`,
-      ];
-
-      if (allProjects) {
-        // Grouped by project
-        const byProject = aggregateByProject(allEntries);
-        let grandTokens = 0, grandCost = 0;
-
-        for (const [project, branches] of byProject) {
-          const sorted = [...branches.entries()].sort((a, b) => b[1].cost - a[1].cost);
-          const projTokens = sorted.reduce((s, [, a]) => s + a.tokens, 0);
-          const projCost = sorted.reduce((s, [, a]) => s + a.cost, 0);
-          grandTokens += projTokens;
-          grandCost += projCost;
-
-          lines.push(`├─ ${project} ─`);
-
-          if (byModel) {
-            const projectEntries = allEntries.filter(e => (e.project || "(unknown)") === project);
-            const byBranchAndModel = aggregateByBranchAndModel(projectEntries);
-            for (const [branch, models] of [...byBranchAndModel.entries()].sort((a, b) => {
-              const aC = [...a[1].values()].reduce((s, m) => s + m.cost, 0);
-              const bC = [...b[1].values()].reduce((s, m) => s + m.cost, 0);
-              return bC - aC;
-            })) {
-              const branchTokens = [...models.values()].reduce((s, m) => s + m.tokens, 0);
-              const branchCost = [...models.values()].reduce((s, m) => s + m.cost, 0);
-              lines.push(`  ${branch}:  ${fmt(branchTokens)} tokens  ${fmtCost(branchCost)}`);
-              for (const [model, agg] of [...models.entries()].sort((a, b) => b[1].cost - a[1].cost)) {
-                lines.push(`    ├─ ${model}:  ${fmt(agg.tokens)} tokens  ${fmtCost(agg.cost)}  (${agg.messageCount} msgs)`);
-              }
-            }
-          } else {
-            for (const [branch, agg] of sorted) {
-              lines.push(formatAggregate(branch, agg));
-            }
-          }
-
-          lines.push(`│  Project total: ${fmt(projTokens)} tokens  ${fmtCost(projCost)}`);
-        }
-
-        lines.push(`├─`);
-        lines.push(`  GRAND TOTAL: ${fmt(grandTokens)} tokens  ${fmtCost(grandCost)}`);
         lines.push(`╰─`);
-      } else {
-        // Single repo
-        if (byModel) {
-          const byBranch = aggregateByBranchAndModel(allEntries);
-          const sortedBranches = [...byBranch.entries()].sort((a, b) => {
-            const aCost = [...a[1].values()].reduce((s, m) => s + m.cost, 0);
-            const bCost = [...b[1].values()].reduce((s, m) => s + m.cost, 0);
-            return bCost - aCost;
-          });
-
-          lines.push(`├─`);
-          let grandTotal = 0, grandCost = 0;
-          for (const [branch, models] of sortedBranches) {
-            const sortedModels = [...models.entries()].sort((a, b) => b[1].cost - a[1].cost);
-            const branchTokens = sortedModels.reduce((s, [, a]) => s + a.tokens, 0);
-            const branchCost = sortedModels.reduce((s, [, a]) => s + a.cost, 0);
-            grandTotal += branchTokens;
-            grandCost += branchCost;
-
-            lines.push(`  ${branch}:`);
-            lines.push(`    Messages:   ${sortedModels.reduce((s, [, a]) => s + a.messageCount, 0)}`);
-            lines.push(`    Total:      ${fmt(branchTokens)} tokens  ${fmtCost(branchCost)}`);
-            for (const [model, agg] of sortedModels) {
-              lines.push(`    ├─ ${model}:  ${fmt(agg.tokens)} tokens  ${fmtCost(agg.cost)}  (${agg.messageCount} msgs)`);
-            }
-            lines.push(`│`);
-          }
-          lines.push(`├─`);
-          lines.push(`  TOTAL: ${fmt(grandTotal)} tokens  ${fmtCost(grandCost)}`);
-          lines.push(`╰─`);
-        } else {
-          // flat per-branch
-          const aggregated = aggregateByBranch(allEntries);
-          const sorted = [...aggregated.entries()].sort((a, b) => b[1].cost - a[1].cost);
-
-          lines.push(`├─`);
-          for (const [branch, agg] of sorted) {
-            lines.push(formatAggregate(branch, agg));
-            lines.push(`│`);
-          }
-
-          const grandTotal = sorted.reduce((s, [, a]) => s + a.tokens, 0);
-          const grandCost = sorted.reduce((s, [, a]) => s + a.cost, 0);
-          lines.push(`├─`);
-          lines.push(`  TOTAL: ${fmt(grandTotal)} tokens  ${fmtCost(grandCost)}`);
-          lines.push(`╰─`);
-        }
       }
+    }
 
-      ctx.ui.notify(lines.join("\n"), "info");
-    },
-  });
+    ctx.ui.notify(lines.join("\n"), "info");
+  }
 
-  // =========================================================================
-  // 4. /project-costs-footer  — toggle a branch-aware footer in the TUI
-  // =========================================================================
+  async function handleFooter(args: string, ctx: any) {
+    footerEnabled = !footerEnabled;
 
-  pi.registerCommand("project-costs-footer", {
-    description: "Toggle a custom footer that shows current branch token usage",
-    handler: async (_args, ctx) => {
-      footerEnabled = !footerEnabled;
+    if (footerEnabled) {
+      ctx.ui.setFooter((tui, theme, footerData) => {
+        const unsub = footerData.onBranchChange(() => tui.requestRender());
 
-      if (footerEnabled) {
-        ctx.ui.setFooter((tui, theme, footerData) => {
-          const unsub = footerData.onBranchChange(() => tui.requestRender());
+        return {
+          dispose: unsub,
+          invalidate() {},
+          render(width: number): string[] {
+            const entries = extractBranchEntries(ctx.sessionManager.getEntries());
+            const aggregated = aggregateByBranch(entries);
 
-          return {
-            dispose: unsub,
-            invalidate() {},
-            render(width: number): string[] {
-              // Compute per-branch stats from session entries
-              const entries = extractBranchEntries(ctx.sessionManager.getEntries());
-              const aggregated = aggregateByBranch(entries);
+            const branch = footerData.getGitBranch() || "no-git";
+            const agg = aggregated.get(branch);
 
-              const branch = footerData.getGitBranch() || "no-git";
-              const agg = aggregated.get(branch);
+            let left: string;
+            let right: string;
 
-              let left: string;
-              let right: string;
-
-              if (agg && agg.messageCount > 0) {
-                left = theme.fg(
-                  "dim",
-                  `↕${fmt(agg.inputTokens)} ↓${fmt(agg.outputTokens)} Σ${fmt(agg.tokens)} ${fmtCost(agg.cost)}`
-                );
-                right = theme.fg("dim", `${ctx.model?.id || ""} (${branch})`);
-              } else {
-                // Fallback: show session-wide totals from all assistant messages
-                let totalIn = 0, totalOut = 0, totalCost = 0;
-                for (const e of ctx.sessionManager.getEntries()) {
-                  if (e.type === "message" && (e.message as AssistantMessage).role === "assistant") {
-                    const m = e.message as AssistantMessage;
-                    totalIn += m.usage?.input ?? 0;
-                    totalOut += m.usage?.output ?? 0;
-                    totalCost += m.usage?.cost?.total ?? 0;
-                  }
+            if (agg && agg.messageCount > 0) {
+              left = theme.fg(
+                "dim",
+                `↕${fmt(agg.inputTokens)} ↓${fmt(agg.outputTokens)} Σ${fmt(agg.tokens)} ${fmtCost(agg.cost)}`
+              );
+              right = theme.fg("dim", `${ctx.model?.id || ""} (${branch})`);
+            } else {
+              let totalIn = 0, totalOut = 0, totalCost = 0;
+              for (const e of ctx.sessionManager.getEntries()) {
+                if (e.type === "message" && (e.message as AssistantMessage).role === "assistant") {
+                  const m = e.message as AssistantMessage;
+                  totalIn += m.usage?.input ?? 0;
+                  totalOut += m.usage?.output ?? 0;
+                  totalCost += m.usage?.cost?.total ?? 0;
                 }
-                left = theme.fg("dim", `↑${fmt(totalIn)} ↓${fmt(totalOut)} $${totalCost.toFixed(3)}`);
-                right = theme.fg("dim", `${ctx.model?.id || ""} (${branch})`);
               }
+              left = theme.fg("dim", `↑${fmt(totalIn)} ↓${fmt(totalOut)} $${totalCost.toFixed(3)}`);
+              right = theme.fg("dim", `${ctx.model?.id || ""} (${branch})`);
+            }
 
-              const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
-              return [truncateToWidth(left + pad + right, width)];
-            },
-          };
-        });
-        ctx.ui.notify("Project cost footer enabled", "info");
-      } else {
-        ctx.ui.setFooter(undefined);
-        ctx.ui.notify("Default footer restored", "info");
+            const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
+            return [truncateToWidth(left + pad + right, width)];
+          },
+        };
+      });
+      ctx.ui.notify("Project cost footer enabled", "info");
+    } else {
+      ctx.ui.setFooter(undefined);
+      ctx.ui.notify("Default footer restored", "info");
+    }
+  }
+
+  async function handleExport(args: string, ctx: any) {
+    const flag = (args || "").trim().toLowerCase();
+    const allProjects = flag === "--all";
+
+    let sessionDirs: string[] = [];
+
+    if (allProjects) {
+      const base = path.join(process.env.HOME || "~", ".pi", "agent", "sessions");
+      if (existsSync(base)) {
+        sessionDirs = readdirSync(base, { withFileTypes: true })
+          .filter((d) => d.isDirectory())
+          .map((d) => path.join(base, d.name));
       }
-    },
-  });
+    } else {
+      const dir = sessionDirFor(ctx.cwd);
+      sessionDirs = [dir];
+    }
 
-  // =========================================================================
-  // 5. /project-costs-export [--all]  — export aggregated costs as CSV
-  // =========================================================================
+    if (sessionDirs.length === 0) {
+      ctx.ui.notify("No session directories found.", "error");
+      return;
+    }
 
-  pi.registerCommand("project-costs-export", {
-    description: "Export per-branch project costs as CSV. Use --all for all projects.",
-    handler: async (args, ctx) => {
-      const flag = (args || "").trim().toLowerCase();
-      const allProjects = flag === "--all";
+    const allEntries: BranchUsageEntry[] = [];
+    let fileCount = 0;
 
-      let sessionDirs: string[] = [];
-
-      if (allProjects) {
-        const base = path.join(process.env.HOME || "~", ".pi", "agent", "sessions");
-        if (existsSync(base)) {
-          sessionDirs = readdirSync(base, { withFileTypes: true })
-            .filter((d) => d.isDirectory())
-            .map((d) => path.join(base, d.name));
-        }
-      } else {
-        const dir = sessionDirFor(ctx.cwd);
-        sessionDirs = [dir];
-      }
-
-      if (sessionDirs.length === 0) {
-        ctx.ui.notify("No session directories found.", "error");
-        return;
-      }
-
-      // Collect branch entries from all session files
-      const allEntries: BranchUsageEntry[] = [];
-      let fileCount = 0;
-
-      for (const dir of sessionDirs) {
-        if (!existsSync(dir)) continue;
-        const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
-        for (const file of files) {
-          fileCount++;
-          const filePath = path.join(dir, file);
-          const rawEntries = parseSessionFile(filePath);
-          const project = allProjects ? projectNameFromDir(dir) : path.basename(ctx.cwd);
-          const branchEntries = extractBranchEntries(rawEntries, project);
-          for (const be of branchEntries) {
-            allEntries.push(be);
-          }
+    for (const dir of sessionDirs) {
+      if (!existsSync(dir)) continue;
+      const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
+      for (const file of files) {
+        fileCount++;
+        const filePath = path.join(dir, file);
+        const rawEntries = parseSessionFile(filePath);
+        const project = allProjects ? projectNameFromDir(dir) : path.basename(ctx.cwd);
+        const branchEntries = extractBranchEntries(rawEntries, project);
+        for (const be of branchEntries) {
+          allEntries.push(be);
         }
       }
+    }
 
-      if (allEntries.length === 0) {
-        ctx.ui.notify(
-          `No project cost tracking data found across ${fileCount} session file(s).`,
-          "info"
-        );
-        return;
-      }
+    if (allEntries.length === 0) {
+      ctx.ui.notify(
+        `No project cost tracking data found across ${fileCount} session file(s).`,
+        "info"
+      );
+      return;
+    }
 
-      // Aggregate and flatten for CSV
-      const csvRows: { project: string; branch: string; agg: BranchAggregate }[] = [];
+    const csvRows: { project: string; branch: string; agg: BranchAggregate }[] = [];
 
-      if (allProjects) {
-        const byProject = aggregateByProject(allEntries);
-        for (const [project, branches] of byProject) {
-          for (const [branch, agg] of branches) {
-            csvRows.push({ project, branch, agg });
-          }
-        }
-      } else {
-        const aggregated = aggregateByBranch(allEntries);
-        const project = path.basename(ctx.cwd);
-        for (const [branch, agg] of aggregated) {
+    if (allProjects) {
+      const byProject = aggregateByProject(allEntries);
+      for (const [project, branches] of byProject) {
+        for (const [branch, agg] of branches) {
           csvRows.push({ project, branch, agg });
         }
       }
+    } else {
+      const aggregated = aggregateByBranch(allEntries);
+      const project = path.basename(ctx.cwd);
+      for (const [branch, agg] of aggregated) {
+        csvRows.push({ project, branch, agg });
+      }
+    }
 
-      // Sort by cost descending
-      csvRows.sort((a, b) => b.agg.cost - a.agg.cost);
+    csvRows.sort((a, b) => b.agg.cost - a.agg.cost);
 
-      // Generate filename with ISO timestamp
-      const now = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const fileName = `project-costs-${now}.csv`;
-      const filePath = path.join(ctx.cwd, fileName);
+    const now = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const fileName = `project-costs-${now}.csv`;
+    const filePath = path.join(ctx.cwd, fileName);
 
-      writeCSV(filePath, csvRows);
+    writeCSV(filePath, csvRows);
 
-      ctx.ui.notify(
-        `Exported ${csvRows.length} branch(es) across ${fileCount} session(s) to ${fileName}`,
-        "info"
-      );
-    },
-  });
+    ctx.ui.notify(
+      `Exported ${csvRows.length} branch(es) across ${fileCount} session(s) to ${fileName}`,
+      "info"
+    );
+  }
+
+  async function handleConfig(args: string, ctx: any) {
+    const config = loadConfig(ctx.cwd);
+    const lines = [
+      `╭─ Project Costs Config`,
+      `│ Enabled:          ${config.enabled}`,
+      `│ Git repos only:   ${config.gitOnly}`,
+      `│ Ignore branches:  ${config.ignoreBranches.join(", ") || "(none)"}`,
+      `╰─`,
+    ];
+    ctx.ui.notify(lines.join("\n"), "info");
+  }
+
+  async function handlePrune(args: string, ctx: any) {
+    const branch = (args || "").trim();
+    if (!branch) {
+      ctx.ui.notify("Usage: /project-costs-prune <branch-name>", "error");
+      return;
+    }
+
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    if (!sessionFile) {
+      ctx.ui.notify("No session file (in-memory session).", "error");
+      return;
+    }
+
+    const { kept, removed } = filterSessionEntries(sessionFile, (entry) => {
+      if (entry.type !== "custom") return "keep";
+      if (entry.customType !== CUSTOM_TYPE && entry.customType !== "branch-tracker:usage") return "keep";
+      if (entry.data?.branch === branch) return "remove";
+      return "keep";
+    });
+
+    if (kept === null) {
+      ctx.ui.notify("Could not read session file.", "error");
+      return;
+    }
+
+    if (removed === 0) {
+      ctx.ui.notify(`No entries found for branch "${branch}" in this session.`, "info");
+      return;
+    }
+
+    ctx.ui.notify(`Removed ${removed} entry(s) for branch "${branch}" from the current session.`, "info");
+  }
+
+  async function handleCleanup(args: string, ctx: any) {
+    const raw = (args || "").trim();
+    const match = raw.match(/^--before\s+(\d{4}-\d{2}-\d{2})$/);
+    if (!match) {
+      ctx.ui.notify("Usage: /project-costs-cleanup --before YYYY-MM-DD", "error");
+      return;
+    }
+
+    const cutoff = new Date(match[1]).getTime();
+    if (isNaN(cutoff)) {
+      ctx.ui.notify("Invalid date. Use YYYY-MM-DD format.", "error");
+      return;
+    }
+
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    if (!sessionFile) {
+      ctx.ui.notify("No session file (in-memory session).", "error");
+      return;
+    }
+
+    const { kept, removed } = filterSessionEntries(sessionFile, (entry) => {
+      if (entry.type !== "custom") return "keep";
+      if (entry.customType !== CUSTOM_TYPE && entry.customType !== "branch-tracker:usage") return "keep";
+      const ts = entry.data?.timestamp ?? 0;
+      if (ts > 0 && ts < cutoff) return "remove";
+      return "keep";
+    });
+
+    if (kept === null) {
+      ctx.ui.notify("Could not read session file.", "error");
+      return;
+    }
+
+    if (removed === 0) {
+      ctx.ui.notify(`No entries before ${match[1]} found in this session.`, "info");
+      return;
+    }
+
+    ctx.ui.notify(`Removed ${removed} entry(s) older than ${match[1]} from the current session.`, "info");
+  }
+
+  async function handleHelp(ctx: any) {
+    const lines = [
+      `╭─ Project Costs — subcommands`,
+      `│ usage [--by-model]           Show costs for current session`,
+      `│ stats [--all|--repo] [--by-model]  Show costs across sessions`,
+      `│ export [--all]               Export costs as CSV`,
+      `│ footer                       Toggle branch cost footer`,
+      `│ config                       Show current configuration`,
+      `│ prune <branch>               Remove entries for a branch`,
+      `│ cleanup --before YYYY-MM-DD  Remove entries older than a date`,
+      `│ help                         Show this message`,
+      `╰─`,
+    ];
+    ctx.ui.notify(lines.join("\n"), "info");
+  }
 
   // =========================================================================
-  // 6. /project-costs-config  — show current config
+  // Single /project-costs dispatcher
   // =========================================================================
 
-  pi.registerCommand("project-costs-config", {
-    description: "Show the current merged configuration",
+  pi.registerCommand("project-costs", {
+    description: "Track LLM token usage and costs per git branch. Use /project-costs help for subcommands.",
     handler: async (_args, ctx) => {
-      const config = loadConfig(ctx.cwd);
-      const lines = [
-        `╭─ Project Costs Config`,
-        `│ Enabled:          ${config.enabled}`,
-        `│ Git repos only:   ${config.gitOnly}`,
-        `│ Ignore branches:  ${config.ignoreBranches.join(", ") || "(none)"}`,
-        `╰─`,
-      ];
-      ctx.ui.notify(lines.join("\n"), "info");
+      const parts = (_args || "").trim().split(/\s+/);
+      const subcommand = parts[0]?.toLowerCase() || "help";
+      const subArgs = parts.slice(1).join(" ");
+
+      switch (subcommand) {
+        case "usage":   return handleUsage(subArgs, ctx);
+        case "stats":   return handleStats(subArgs, ctx);
+        case "export":  return handleExport(subArgs, ctx);
+        case "footer":  return handleFooter(subArgs, ctx);
+        case "config":  return handleConfig(subArgs, ctx);
+        case "prune":   return handlePrune(subArgs, ctx);
+        case "cleanup": return handleCleanup(subArgs, ctx);
+        case "help":    return handleHelp(ctx);
+        default:
+          ctx.ui.notify(`Unknown subcommand "${subcommand}". Use /project-costs help for available commands.`, "error");
+      }
     },
   });
 
   // =========================================================================
-  // 7. /project-costs-prune <branch>  — remove entries for a branch
-  // =========================================================================
-
-  pi.registerCommand("project-costs-prune", {
-    description: "Remove all cost entries for a given branch name from the current session",
-    handler: async (args, ctx) => {
-      const branch = (args || "").trim();
-      if (!branch) {
-        ctx.ui.notify("Usage: /project-costs-prune <branch-name>", "error");
-        return;
-      }
-
-      const sessionFile = ctx.sessionManager.getSessionFile();
-      if (!sessionFile) {
-        ctx.ui.notify("No session file (in-memory session).", "error");
-        return;
-      }
-
-      const { kept, removed } = filterSessionEntries(sessionFile, (entry) => {
-        if (entry.type !== "custom") return "keep";
-        if (entry.customType !== CUSTOM_TYPE && entry.customType !== "branch-tracker:usage") return "keep";
-        if (entry.data?.branch === branch) return "remove";
-        return "keep";
-      });
-
-      if (kept === null) {
-        ctx.ui.notify("Could not read session file.", "error");
-        return;
-      }
-
-      if (removed === 0) {
-        ctx.ui.notify(`No entries found for branch "${branch}" in this session.`, "info");
-        return;
-      }
-
-      ctx.ui.notify(`Removed ${removed} entry(s) for branch "${branch}" from the current session.`, "info");
-    },
-  });
 
   // =========================================================================
-  // 8. /project-costs-cleanup --before YYYY-MM-DD  — remove old entries
-  // =========================================================================
-
-  pi.registerCommand("project-costs-cleanup", {
-    description: "Remove cost entries older than a date from the current session. Usage: /project-costs-cleanup --before YYYY-MM-DD",
-    handler: async (args, ctx) => {
-      const raw = (args || "").trim();
-      const match = raw.match(/^--before\s+(\d{4}-\d{2}-\d{2})$/);
-      if (!match) {
-        ctx.ui.notify("Usage: /project-costs-cleanup --before YYYY-MM-DD", "error");
-        return;
-      }
-
-      const cutoff = new Date(match[1]).getTime();
-      if (isNaN(cutoff)) {
-        ctx.ui.notify("Invalid date. Use YYYY-MM-DD format.", "error");
-        return;
-      }
-
-      const sessionFile = ctx.sessionManager.getSessionFile();
-      if (!sessionFile) {
-        ctx.ui.notify("No session file (in-memory session).", "error");
-        return;
-      }
-
-      const { kept, removed } = filterSessionEntries(sessionFile, (entry) => {
-        if (entry.type !== "custom") return "keep";
-        if (entry.customType !== CUSTOM_TYPE && entry.customType !== "branch-tracker:usage") return "keep";
-        const ts = entry.data?.timestamp ?? 0;
-        if (ts > 0 && ts < cutoff) return "remove";
-        return "keep";
-      });
-
-      if (kept === null) {
-        ctx.ui.notify("Could not read session file.", "error");
-        return;
-      }
-
-      if (removed === 0) {
-        ctx.ui.notify(`No entries before ${match[1]} found in this session.`, "info");
-        return;
-      }
-
-      ctx.ui.notify(`Removed ${removed} entry(s) older than ${match[1]} from the current session.`, "info");
-    },
-  });
 }

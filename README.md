@@ -14,12 +14,14 @@ pi -e ./path/to/pi-project-costs/extensions/pi-project-costs.ts
 
 ## Commands
 
-### `/project-costs-usage [--by-model]`
+All features are subcommands of `/project-costs`. Run `/project-costs help` to see available options.
+
+### `/project-costs usage [--by-model]`
 
 Per-branch token and cost report for the current session, sorted by cost descending.
 
 ```
-/project-costs-usage
+/project-costs usage
 
   feature/api-v2:
     Total:  12.4k tokens  $0.04  (4 msgs)
@@ -30,7 +32,7 @@ Per-branch token and cost report for the current session, sorted by cost descend
 Pass `--by-model` to break each branch down by model:
 
 ```
-/project-costs-usage --by-model
+/project-costs usage --by-model
 
   feature/api-v2:
     Messages: 4
@@ -43,12 +45,12 @@ Pass `--by-model` to break each branch down by model:
     └─ claude-sonnet-4-20250514:  3.1k tokens  $0.01  (1 msg)
 ```
 
-### `/project-costs-stats [--all | --repo] [--by-model]`
+### `/project-costs stats [--all | --repo] [--by-model]`
 
 Cross-session aggregation across all saved sessions for the repo.
 
 ```
-/project-costs-stats --repo
+/project-costs stats --repo
 
   feature/api-v2:
     Total:  45.2k tokens  $0.15  (14 msgs)
@@ -60,44 +62,48 @@ Cross-session aggregation across all saved sessions for the repo.
 
 Use `--all` to scan every project on the machine, `--by-model` for per-model subtotals.
 
-### `/project-costs-export [--all]`
+### `/project-costs export [--all]`
 
 Export aggregated costs as CSV. Writes `project-costs-<timestamp>.csv` to the current directory.
 
 - Default: current repo only
 - `--all`: all projects (adds a project column)
 
-### `/project-costs-prune <branch>`
+### `/project-costs prune <branch>`
 
-Remove all cost entries for a given branch from the current session. Useful after merging a feature branch to keep the usage report focused on active work.
+Remove all cost entries for a given branch from the current session. Useful after merging a feature branch.
 
 ```
-/project-costs-prune feature/old-experiment
+/project-costs prune feature/old-experiment
 ```
 
-### `/project-costs-cleanup --before YYYY-MM-DD`
+### `/project-costs cleanup --before YYYY-MM-DD`
 
 Remove cost entries older than a date from the current session.
 
 ```
-/project-costs-cleanup --before 2026-01-01
+/project-costs cleanup --before 2026-01-01
 ```
 
-### `/project-costs-footer`
+### `/project-costs footer`
 
 Toggle a real-time footer in the TUI showing the current branch's token usage. Run again to disable.
 
-### `/project-costs-config`
+### `/project-costs config`
 
 Display the active merged configuration:
 
 ```
-/project-costs-config
+/project-costs config
 
   Enabled:         true
   Git repos only:  true
   Ignore branches: main, master
 ```
+
+### `/project-costs help`
+
+Show all available subcommands and their usage.
 
 ## Configuration
 
