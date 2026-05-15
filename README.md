@@ -98,7 +98,7 @@ Optional JSON files control tracking behavior. Merge priority: project > global 
 {
   "enabled": true,         // master switch; set false to stop all tracking
   "gitOnly": true,         // only record inside git repos (avoids "unknown" entries)
-  "ignoreBranches": []     // branch names to skip (default: ["main", "master"])
+  "ignoreBranches": ["main", "master"]  // branch names to skip (default shown)
 }
 ```
 
