@@ -8,3 +8,6 @@ node_modules/
 
 # TypeScript incremental builds
 *.tsbuildinfo
+
+# Internal planning docs
+PLAN.md

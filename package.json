@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Track LLM token usage and costs per git branch across pi sessions",
   "keywords": ["pi-package"],
-  "author": "",
+  "author": "LightBreakfast",
   "license": "MIT",
   "pi": {
     "extensions": ["./extensions"]
@@ -11,7 +11,6 @@
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-tui": "*"
   }
 }
