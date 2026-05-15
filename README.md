@@ -67,6 +67,22 @@ Export aggregated costs as CSV. Writes `project-costs-<timestamp>.csv` to the cu
 - Default: current repo only
 - `--all`: all projects (adds a project column)
 
+### `/project-costs-prune <branch>`
+
+Remove all cost entries for a given branch from the current session. Useful after merging a feature branch to keep the usage report focused on active work.
+
+```
+/project-costs-prune feature/old-experiment
+```
+
+### `/project-costs-cleanup --before YYYY-MM-DD`
+
+Remove cost entries older than a date from the current session.
+
+```
+/project-costs-cleanup --before 2026-01-01
+```
+
 ### `/project-costs-footer`
 
 Toggle a real-time footer in the TUI showing the current branch's token usage. Run again to disable.

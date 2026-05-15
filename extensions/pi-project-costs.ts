@@ -5,10 +5,13 @@
  *
  * Features:
  *   • Auto-records the current git branch on every assistant message
- *   • /project-costs-usage  — per-branch token & cost report for the current session
- *   • /project-costs-stats  — per-branch stats across ALL sessions for this repo
- *   • /project-costs-footer — toggle a footer showing current branch usage in real time
- *   • /project-costs-export — export aggregated branch costs as CSV
+ *   • /project-costs-usage   — per-branch token & cost report for the current session
+ *   • /project-costs-stats   — per-branch stats across ALL sessions for this repo
+ *   • /project-costs-export  — export aggregated branch costs as CSV
+ *   • /project-costs-footer  — toggle a footer showing current branch usage in real time
+ *   • /project-costs-config  — show current merged configuration
+ *   • /project-costs-prune   — remove entries for a branch from the current session
+ *   • /project-costs-cleanup — remove entries older than a date
  *
  * Stored as session custom entries so data survives restarts:
  *   { customType: "project-costs:usage", data: { branch, usage, model, timestamp } }
@@ -198,6 +201,46 @@ function parseSessionFile(filePath: string): any[] {
     return entries;
   } catch {
     return [];
+  }
+}
+
+/**
+ * Read a session JSONL file, apply a filter function to each entry, and write
+ * back only the kept entries. Returns { kept: line count written (null on read
+ * error), removed: count of removed entries }.
+ */
+function filterSessionEntries(
+  filePath: string,
+  decide: (entry: any) => "keep" | "remove",
+): { kept: number | null; removed: number } {
+  try {
+    const raw = readFileSync(filePath, "utf8");
+    const lines = raw.trim().split("\n");
+    let kept = 0;
+    let removed = 0;
+    const output: string[] = [];
+
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        const action = decide(entry);
+        if (action === "remove") {
+          removed++;
+        } else {
+          output.push(line);
+          kept++;
+        }
+      } catch {
+        // malformed line — preserve as-is
+        output.push(line);
+        kept++;
+      }
+    }
+
+    writeFileSync(filePath, output.join("\n") + (output.length > 0 ? "\n" : ""), "utf8");
+    return { kept, removed };
+  } catch {
+    return { kept: null, removed: 0 };
   }
 }
 
@@ -839,6 +882,94 @@ export default function (pi: ExtensionAPI) {
         `╰─`,
       ];
       ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
+  // =========================================================================
+  // 7. /project-costs-prune <branch>  — remove entries for a branch
+  // =========================================================================
+
+  pi.registerCommand("project-costs-prune", {
+    description: "Remove all cost entries for a given branch name from the current session",
+    handler: async (args, ctx) => {
+      const branch = (args || "").trim();
+      if (!branch) {
+        ctx.ui.notify("Usage: /project-costs-prune <branch-name>", "error");
+        return;
+      }
+
+      const sessionFile = ctx.sessionManager.getSessionFile();
+      if (!sessionFile) {
+        ctx.ui.notify("No session file (in-memory session).", "error");
+        return;
+      }
+
+      const { kept, removed } = filterSessionEntries(sessionFile, (entry) => {
+        if (entry.type !== "custom") return "keep";
+        if (entry.customType !== CUSTOM_TYPE && entry.customType !== "branch-tracker:usage") return "keep";
+        if (entry.data?.branch === branch) return "remove";
+        return "keep";
+      });
+
+      if (kept === null) {
+        ctx.ui.notify("Could not read session file.", "error");
+        return;
+      }
+
+      if (removed === 0) {
+        ctx.ui.notify(`No entries found for branch "${branch}" in this session.`, "info");
+        return;
+      }
+
+      ctx.ui.notify(`Removed ${removed} entry(s) for branch "${branch}" from the current session.`, "info");
+    },
+  });
+
+  // =========================================================================
+  // 8. /project-costs-cleanup --before YYYY-MM-DD  — remove old entries
+  // =========================================================================
+
+  pi.registerCommand("project-costs-cleanup", {
+    description: "Remove cost entries older than a date from the current session. Usage: /project-costs-cleanup --before YYYY-MM-DD",
+    handler: async (args, ctx) => {
+      const raw = (args || "").trim();
+      const match = raw.match(/^--before\s+(\d{4}-\d{2}-\d{2})$/);
+      if (!match) {
+        ctx.ui.notify("Usage: /project-costs-cleanup --before YYYY-MM-DD", "error");
+        return;
+      }
+
+      const cutoff = new Date(match[1]).getTime();
+      if (isNaN(cutoff)) {
+        ctx.ui.notify("Invalid date. Use YYYY-MM-DD format.", "error");
+        return;
+      }
+
+      const sessionFile = ctx.sessionManager.getSessionFile();
+      if (!sessionFile) {
+        ctx.ui.notify("No session file (in-memory session).", "error");
+        return;
+      }
+
+      const { kept, removed } = filterSessionEntries(sessionFile, (entry) => {
+        if (entry.type !== "custom") return "keep";
+        if (entry.customType !== CUSTOM_TYPE && entry.customType !== "branch-tracker:usage") return "keep";
+        const ts = entry.data?.timestamp ?? 0;
+        if (ts > 0 && ts < cutoff) return "remove";
+        return "keep";
+      });
+
+      if (kept === null) {
+        ctx.ui.notify("Could not read session file.", "error");
+        return;
+      }
+
+      if (removed === 0) {
+        ctx.ui.notify(`No entries before ${match[1]} found in this session.`, "info");
+        return;
+      }
+
+      ctx.ui.notify(`Removed ${removed} entry(s) older than ${match[1]} from the current session.`, "info");
     },
   });
 }
