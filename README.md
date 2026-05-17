@@ -12,6 +12,17 @@ pi install git:github.com/LightBreakfast/pi-project-costs
 pi -e ./path/to/pi-project-costs/extensions/pi-project-costs.ts
 ```
 
+## Development
+
+```bash
+npm install
+npm test
+npm run check
+```
+
+- `npm test`: runs the initial regression tests for parsing, aggregation, and session filtering.
+- `npm run check`: type-checks the extension against the Pi package APIs used by this repo.
+
 ## Commands
 
 All features are subcommands of `/project-costs`. Run `/project-costs help` to see available options.
@@ -109,18 +120,18 @@ Show all available subcommands and their usage.
 
 Optional JSON files control tracking behavior. Merge priority: project > global > defaults.
 
-| Location | Scope |
-|----------|-------|
-| `~/.pi/agent/extensions/pi-project-costs.json` | Global (all projects) |
-| `.pi/extensions/pi-project-costs.json` | Project (overrides global) |
+| Location                                       | Scope                      |
+| ---------------------------------------------- | -------------------------- |
+| `~/.pi/agent/extensions/pi-project-costs.json` | Global (all projects)      |
+| `.pi/extensions/pi-project-costs.json`         | Project (overrides global) |
 
 ### Schema
 
 ```jsonc
 {
-  "enabled": true,         // master switch; set false to stop all tracking
-  "gitOnly": true,         // only record inside git repos (avoids "unknown" entries)
-  "ignoreBranches": ["main", "master"]  // branch names to skip (default shown)
+  "enabled": true, // master switch; set false to stop all tracking
+  "gitOnly": true, // only record inside git repos (avoids "unknown" entries)
+  "ignoreBranches": ["main", "master"], // branch names to skip (default shown)
 }
 ```
 

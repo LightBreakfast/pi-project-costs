@@ -2,11 +2,26 @@
   "name": "pi-project-costs",
   "version": "0.1.0",
   "description": "Track LLM token usage and costs per git branch across pi sessions",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "author": "LightBreakfast",
   "license": "MIT",
+  "scripts": {
+    "check": "tsc -p tsconfig.json",
+    "test": "tsx --test tests/**/*.test.ts"
+  },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.74.1",
+    "@earendil-works/pi-coding-agent": "^0.74.1",
+    "@earendil-works/pi-tui": "^0.74.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.8.3"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
